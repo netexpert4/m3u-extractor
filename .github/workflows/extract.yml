@@ -1,27 +1,21 @@
-name: Extract Stream
+name: Extract Playlist
 
 on:
   schedule:
-    - cron: "*/10 * * * *" # her 10 dakikada bir
+    - cron: "*/5 * * * *"   # her 5 dakikada bir
   workflow_dispatch:
 
 jobs:
   extract:
     runs-on: ubuntu-latest
     steps:
-      - name: Checkout
-        uses: actions/checkout@v3
+      - uses: actions/checkout@v3
 
-      - name: Setup Node
-        uses: actions/setup-node@v3
-        with:
-          node-version: 18
+      - run: npm init -y
+      - run: npm install playwright node-fetch
 
-      - name: Install dependencies
-        run: npm install
-
-      - name: Install Playwright Browsers
-        run: npx playwright install --with-deps
-
-      - name: Run extractor
-        run: node extract-and-send.js
+      - run: node extract-and-send.js
+        env:
+          TARGET_URL: ${{ secrets.TARGET_URL }}
+          WORKER_UPDATE_URL: ${{ secrets.WORKER_UPDATE_URL }}
+          WORKER_SECRET: ${{ secrets.WORKER_SECRET }}
