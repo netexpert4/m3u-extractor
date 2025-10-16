@@ -1,32 +1,27 @@
-name: extract-and-update
+name: Extract Stream
 
 on:
   schedule:
-    - cron: '*/5 * * * *' # her 5 dakikada bir
-  workflow_dispatch: {} # manuel tetikleme
+    - cron: "*/10 * * * *" # her 10 dakikada bir
+  workflow_dispatch:
 
 jobs:
   extract:
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v3
 
       - name: Setup Node
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v3
         with:
-          node-version: '18'
+          node-version: 18
 
       - name: Install dependencies
         run: npm install
-        env:
-          CI: true
 
-      - name: Run Playwright extraction
-        uses: microsoft/playwright-github-action@v1
-        with:
-          run: node extract-and-send.js
-        env:
-          TARGET_PAGE: ${{ secrets.TARGET_PAGE }}
-          WORKER_UPDATE_URL: ${{ secrets.WORKER_UPDATE_URL }}
-          WORKER_SECRET: ${{ secrets.WORKER_SECRET }}
+      - name: Install Playwright Browsers
+        run: npx playwright install --with-deps
+
+      - name: Run extractor
+        run: node extractor.js
