@@ -1,0 +1,12 @@
+{
+  "name": "m3u-extractor",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "start": "node extract-and-send.js"
+  },
+  "dependencies": {
+    "node-fetch": "^2.6.7",
+    "playwright": "^1.40.0"
+  }
+}
