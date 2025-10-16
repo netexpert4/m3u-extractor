@@ -1,4 +1,3 @@
-// extract-and-send.js
 const { chromium } = require("playwright");
 const fetch = require("node-fetch");
 
@@ -6,43 +5,50 @@ const fetch = require("node-fetch");
   const browser = await chromium.launch({ headless: true });
   const page = await browser.newPage();
 
-  // Sayfayı aç
   await page.goto(process.env.TARGET_URL, { waitUntil: "networkidle" });
 
-  let playlistUrl;
+  // Sayfanın JS değişkenlerini evaluate ile oku
+  const playlistUrl = await page.evaluate(() => {
+    // window veya global JS değişkeninde linki bul
+    // Bu örnek yoda.az özelinde değişebilir, genellikle player config içinde oluyor
+    if (window.playerConfig && window.playerConfig.sources) {
+      const source = window.playerConfig.sources.find(s => s.file && s.file.includes(".m3u8"));
+      if (source) return source.file;
+    }
 
-  try {
-    // 25 saniye boyunca .m3u8 & token içeren response bekle
-    const response = await page.waitForResponse(
-      r => r.url().includes(".m3u8") && r.url().includes("token="),
-      { timeout: 25000 } // 25 saniye
-    );
+    // Alternatif: global state içinde arama
+    if (window.__INITIAL_STATE__) {
+      const tracks = window.__INITIAL_STATE__.tracks || [];
+      for (const t of tracks) {
+        if (t.url && t.url.includes(".m3u8")) return t.url;
+      }
+    }
 
-    playlistUrl = response.url();
-  } catch (err) {
-    console.log("Playlist bulunamadı (timeout veya network issue)");
+    return null;
+  });
+
+  if (!playlistUrl) {
+    console.log("Playlist bulunamadı (JS değişkenlerinde yok)");
     await browser.close();
     process.exit(1);
   }
 
-  if (playlistUrl) {
-    console.log("Playlist bulundu:", playlistUrl);
+  console.log("Playlist bulundu:", playlistUrl);
 
-    // Worker'a gönder
-    const res = await fetch(`${process.env.WORKER_UPDATE_URL}/update`, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        "Authorization": `Bearer ${process.env.WORKER_SECRET}`
-      },
-      body: JSON.stringify({ playlistUrl })
-    });
+  // Worker'a gönder
+  const res = await fetch(`${process.env.WORKER_UPDATE_URL}/update`, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/json",
+      "Authorization": `Bearer ${process.env.WORKER_SECRET}`
+    },
+    body: JSON.stringify({ playlistUrl })
+  });
 
-    if (res.ok) {
-      console.log("Worker'a gönderildi ✅");
-    } else {
-      console.log("Worker'a gönderilemedi ❌", await res.text());
-    }
+  if (res.ok) {
+    console.log("Worker'a gönderildi ✅");
+  } else {
+    console.log("Worker'a gönderilemedi ❌", await res.text());
   }
 
   await browser.close();
