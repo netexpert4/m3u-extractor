@@ -2,19 +2,33 @@ name: Extract Playlist
 
 on:
   schedule:
-    - cron: "*/5 * * * *"   # her 5 dakikada bir
+    - cron: "*/5 * * * *"   # her 5 dakikada bir çalışır
   workflow_dispatch:
 
 jobs:
   extract:
     runs-on: ubuntu-latest
     steps:
+      # 1️⃣ Repo'yu checkout et
       - uses: actions/checkout@v3
 
-      - run: npm init -y
-      - run: npm install playwright node-fetch
+      # 2️⃣ Node.js kurulumu
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: 20
 
-      - run: node extract-and-send.js
+      # 3️⃣ Bağımlılıkları yükle
+      - name: Install dependencies
+        run: npm install
+
+      # 4️⃣ Playwright tarayıcılarını indir
+      - name: Install Playwright browsers
+        run: npx playwright install --with-deps
+
+      # 5️⃣ Extractor scriptini çalıştır
+      - name: Run extractor
+        run: node extract-and-send.js
         env:
           TARGET_URL: ${{ secrets.TARGET_URL }}
           WORKER_UPDATE_URL: ${{ secrets.WORKER_UPDATE_URL }}
