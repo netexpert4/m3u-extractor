@@ -1,14 +1,13 @@
 // extract-and-send.js
-// Captures tokened and non-tokened m3u8 links, filters ads, sends best to Worker
+// Aggressive extractor with reloads + fallback for tokened and non-tokened m3u8
 // Usage (env): TARGET_URL, WORKER_UPDATE_URL, WORKER_SECRET
-// Optional envs: HEADLESS (default true), NAV_TIMEOUT (ms), WAIT_AFTER_LOAD (ms)
-
 const { chromium } = require("playwright");
 const fetch = (...args) => import('node-fetch').then(m => m.default(...args));
 
-const MAX_ATTEMPTS = 1; // only 1 attempt
-const NAV_TIMEOUT = parseInt(process.env.NAV_TIMEOUT || "90000", 10);
-const WAIT_AFTER_LOAD = parseInt(process.env.WAIT_AFTER_LOAD || "20000", 10);
+const MAX_RELOADS = 3;
+const NAV_TIMEOUT = 30000;      // navigation timeout per attempt
+const WAIT_AFTER_LOAD = 5000;   // wait for page JS to run
+const RESP_TIMEOUT = 15000;     // wait for network responses
 const HEADLESS = process.env.HEADLESS !== "false";
 
 function now() { return new Date().toISOString(); }
@@ -24,7 +23,7 @@ function now() { return new Date().toISOString(); }
   }
 
   console.log(`[${now()}] extractor: start`);
-  console.log(`[${now()}] TARGET_URL: ${TARGET_URL}  HEADLESS: ${HEADLESS}`);
+  console.log(`[${now()}] TARGET_URL: ${TARGET_URL} HEADLESS: ${HEADLESS}`);
 
   const browser = await chromium.launch({
     headless: HEADLESS,
@@ -32,123 +31,115 @@ function now() { return new Date().toISOString(); }
   });
 
   const context = await browser.newContext({
-    userAgent: process.env.USER_AGENT ||
+    userAgent: process.env.USER_AGENT || 
       "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36",
-    viewport: { width: 1280, height: 720 }
+    viewport: { width: 1280, height: 720 },
+    javaScriptEnabled: true,
+    extraHTTPHeaders: { "accept-language": "tr-TR,tr;q=0.9,en-US;q=0.8" }
   });
 
   const page = await context.newPage();
   const candidates = new Set();
   const seenRequests = new Set();
 
-  // Network listeners to capture m3u8
+  // capture requests
   page.on('request', req => {
     try {
       const u = req.url();
       if (seenRequests.has(u)) return;
       seenRequests.add(u);
-      if (u.includes(".m3u8")) candidates.add(u);
-    } catch(e){}
+      if (u.includes('.m3u8') || u.includes('.ts') || u.includes('token=')) {
+        candidates.add(u);
+        console.log("[REQ]", u);
+      }
+    } catch(e){ }
   });
 
   page.on('response', async resp => {
     try {
       const u = resp.url();
-      if (seenRequests.has(u)) return;
-      seenRequests.add(u);
-      const ct = (resp.headers()['content-type'] || '').toLowerCase();
-      if (u.includes(".m3u8") || ct.includes('mpegurl') || ct.includes('application/vnd.apple.mpegurl')) {
+      if (seenRequests.has(u)) seenRequests.add(u);
+      const ct = (resp.headers()['content-type']||'').toLowerCase();
+      if (u.includes('.m3u8') || ct.includes('mpegurl')) {
         candidates.add(u);
+        console.log("[RES] probable m3u8:", u);
       }
-    } catch(e){}
+    } catch(e){ }
   });
 
-  // Inject fetch/XHR hook
-  await context.addInitScript(() => {
-    try {
-      window.__capturedRequests = window.__capturedRequests || [];
-      const _fetch = window.fetch;
-      window.fetch = async function(...args) {
-        if (typeof args[0] === 'string') window.__capturedRequests.push(args[0]);
-        else if (args[0] && args[0].url) window.__capturedRequests.push(args[0].url);
-        return _fetch.apply(this, args);
-      };
-      const XHR = window.XMLHttpRequest;
-      const open = XHR.prototype.open;
-      XHR.prototype.open = function(method, url) {
-        try { window.__capturedRequests.push(url); } catch(e){}
-        return open.apply(this, arguments);
-      };
-    } catch(e){}
-  });
-
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    console.log(`--- Attempt ${attempt}/${MAX_ATTEMPTS} ---`);
+  // reload loop
+  for (let attempt = 1; attempt <= MAX_RELOADS; attempt++) {
+    console.log(`\n--- Attempt ${attempt}/${MAX_RELOADS} ---`);
     try {
       await page.goto(TARGET_URL, { waitUntil: 'load', timeout: NAV_TIMEOUT });
-    } catch(e) {
-      console.log("[warn] navigation failed:", e.message);
-    }
+    } catch(e) { console.log("[warn] goto failed:", e.message); }
     await page.waitForTimeout(WAIT_AFTER_LOAD);
 
-    // Capture requests from page context
+    // scan DOM + video elements
     try {
-      const winReqs = await page.evaluate(() => window.__capturedRequests || []);
-      winReqs.forEach(u => candidates.add(u));
+      const domLinks = await page.evaluate(() => {
+        const out = new Set();
+        document.querySelectorAll('video, source').forEach(v=>{
+          if(v.src) out.add(v.src);
+          if(v.currentSrc) out.add(v.currentSrc);
+        });
+        const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+        let node;
+        while(node = walker.nextNode()) {
+          if(node.nodeValue && node.nodeValue.includes('.m3u8')) {
+            node.nodeValue.match(/https?:\/\/[^\s"']+\.m3u8[^\s"']*/ig)?.forEach(u=>out.add(u));
+          }
+        }
+        return Array.from(out);
+      });
+      domLinks.forEach(u => candidates.add(u));
+      if(domLinks.length) console.log("[dom-scan] found:", domLinks);
     } catch(e){}
 
-    // Evaluate best candidate
     const list = Array.from(candidates);
-    const best = pickBest(list);
-    if (best) {
-      const ok = await sendToWorker(best, WORKER_BASE, WORKER_SECRET);
-      if (ok) {
-        console.log("[success] sent to worker:", best);
-        await browser.close();
-        process.exit(0);
+    if(list.length) {
+      const best = pickBest(list);
+      if(best) {
+        const ok = await sendToWorker(best, WORKER_BASE, WORKER_SECRET);
+        if(ok) {
+          console.log("[success] sent to worker:", best);
+          await browser.close();
+          process.exit(0);
+        } else console.log("[warn] worker rejected:", best);
       }
+    }
+
+    if(attempt < MAX_RELOADS){
+      console.log("[info] reloading page before next attempt...");
+      await page.reload({ waitUntil: 'load', timeout: NAV_TIMEOUT }).catch(()=>{});
+      await page.waitForTimeout(3000);
     }
   }
 
-  console.log("[final] attempts exhausted — no m3u8 captured");
+  console.log("[final] no m3u8 captured");
   await browser.close();
   process.exit(1);
 
-  function pickBest(list) {
-    // remove duplicates
-    const uniq = Array.from(new Set(list));
-
-    // remove obvious ad URLs
-    const filtered = uniq.filter(u => !u.includes('ads') && !u.includes('adserver') && !u.includes('doubleclick'));
-
-    if (!filtered.length) return null;
-
-    // prefer .m3u8 with token if available
-    const tokened = filtered.find(u => u.includes(".m3u8") && /token=|signature=|sig=|expires=|exp=/.test(u));
-    if (tokened) return tokened;
-
-    // fallback: pick first non-tokened m3u8
-    const nonTokened = filtered.find(u => u.includes(".m3u8"));
-    if (nonTokened) return nonTokened;
-
+  function pickBest(list){
+    // remove ads / known non-video patterns (example filter)
+    const filtered = list.filter(u => !u.includes('ads') && u.includes('.m3u8'));
+    // prefer tokened
+    const tokened = filtered.filter(u => /token=|sig=|signature=/.test(u));
+    if(tokened.length) return tokened[0];
+    if(filtered.length) return filtered[0]; // fallback to first m3u8
     return null;
   }
 
-  async function sendToWorker(url, base, secret) {
+  async function sendToWorker(url, base, secret){
     try {
-      const res = await fetch(base.replace(/\/+$/, "") + "/update", {
+      const res = await fetch(base.replace(/\/+$/,'') + "/update", {
         method: "POST",
-        headers: { "Content-Type": "application/json", "Authorization": `Bearer ${secret}` },
+        headers: { "Content-Type":"application/json", "Authorization":`Bearer ${secret}` },
         body: JSON.stringify({ playlistUrl: url })
       });
       console.log("[worker] status", res.status);
-      const txt = await res.text().catch(()=>"");
-      console.log("[worker] body:", txt);
       return res.ok;
-    } catch(e){
-      console.log("[worker] send error:", e && e.message);
-      return false;
-    }
+    } catch(e){ console.log("[worker] send error:", e.message); return false; }
   }
 
 })();
