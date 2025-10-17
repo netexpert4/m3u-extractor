@@ -1,13 +1,15 @@
 // extract-and-send.js
-// Final short-run ultimate extractor: tries many hooks but stops fast (3 attempts, ~70s per attempt).
-// Usage: ensure playwright + node-fetch installed. Env: TARGET_URL, WORKER_UPDATE_URL, WORKER_SECRET
+// Combined aggressive + permissive capture: will capture tokened OR tokenless .m3u8 manifests.
+// Usage: env TARGET_URL, WORKER_UPDATE_URL, WORKER_SECRET
+// Recommended: run in environment with playwright installed and browsers present.
 
 const { chromium } = require("playwright");
 const fetch = (...args) => import('node-fetch').then(m => m.default(...args));
 
-const MAX_ATTEMPTS = parseInt(process.env.ATTEMPTS || "3", 10); // 3 attempts
-const NAV_TIMEOUT = parseInt(process.env.NAV_TIMEOUT || "30000", 10); // 30s goto timeout
-const WAIT_AFTER_LOAD = parseInt(process.env.WAIT_AFTER_LOAD || "40000", 10); // 40s wait for resources after load
+const MAX_ATTEMPTS = parseInt(process.env.ATTEMPTS || "4", 10); // 3-4 attempts
+const NAV_TIMEOUT = parseInt(process.env.NAV_TIMEOUT || "45000", 10); // 45s navigation timeout
+const WAIT_AFTER_LOAD = parseInt(process.env.WAIT_AFTER_LOAD || "15000", 10); // 15s wait after load per attempt
+const RESPONSE_WAIT = parseInt(process.env.RESPONSE_WAIT || "20000", 10); // waitForResponse up to 20s per attempt
 const HEADLESS = process.env.HEADLESS !== "false";
 
 function now(){ return new Date().toISOString(); }
@@ -22,14 +24,11 @@ function now(){ return new Date().toISOString(); }
     process.exit(1);
   }
 
-  console.log(`[${now()}] short-run extractor start — target: ${TARGET}`);
+  console.log(`[${now()}] extractor start — target: ${TARGET}`);
 
   const browser = await chromium.launch({
     headless: HEADLESS,
-    args: [
-      "--no-sandbox","--disable-setuid-sandbox",
-      "--disable-dev-shm-usage","--disable-blink-features=AutomationControlled"
-    ]
+    args: ["--no-sandbox","--disable-setuid-sandbox","--disable-dev-shm-usage","--disable-blink-features=AutomationControlled"]
   });
 
   const context = await browser.newContext({
@@ -41,14 +40,10 @@ function now(){ return new Date().toISOString(); }
     extraHTTPHeaders: { "accept-language": "tr-TR,tr;q=0.9,en-US;q=0.8" }
   });
 
-  // stealth-ish init + monkey patches: fetch, XHR, URL.createObjectURL, MutationObserver + performance hook
+  // stealth-ish small tweaks + in-page patches to catch dynamic creation
   await context.addInitScript(() => {
-    try {
-      Object.defineProperty(navigator, 'webdriver', { get: () => false, configurable: true });
-    } catch(e){}
+    try { Object.defineProperty(navigator, 'webdriver', { get: () => false, configurable: true }); } catch(e){}
     try { window.chrome = window.chrome || { runtime: {} }; } catch(e){}
-    try { Object.defineProperty(navigator, 'languages', { get: () => ['tr-TR','tr','en-US','en'] }); } catch(e){}
-
     // capture arrays
     window.__capturedRequests = window.__capturedRequests || [];
     window.__createdBlobs = window.__createdBlobs || [];
@@ -71,7 +66,7 @@ function now(){ return new Date().toISOString(); }
       const X = window.XMLHttpRequest;
       const open = X.prototype.open;
       X.prototype.open = function(method, url) {
-        try { window.__capturedRequests.push(String(url)); } catch(e){}
+        try { if (url) window.__capturedRequests.push(String(url)); } catch(e){}
         return open.apply(this, arguments);
       };
     } catch(e){}
@@ -87,37 +82,30 @@ function now(){ return new Date().toISOString(); }
 
     // MutationObserver to catch late-added src attrs
     try {
-      new MutationObserver((mutations) => {
+      new MutationObserver(mutations => {
         try {
           for (const m of mutations) {
-            const nodes = m.addedNodes || [];
-            nodes.forEach(n => {
-              if (!n) return;
-              if (n.nodeType === 1) {
-                const el = n;
-                if (el.src && el.src.includes(".m3u8")) window.__capturedRequests.push(el.src);
-                // search children
-                el.querySelectorAll && el.querySelectorAll("video,source,script").forEach(ch => {
-                  try {
-                    const s = ch.src || ch.getAttribute("data-src") || ch.getAttribute("data-href");
-                    if (s && s.includes(".m3u8")) window.__capturedRequests.push(s);
-                  } catch(e){}
-                });
-              }
+            (m.addedNodes||[]).forEach(n => {
+              try {
+                if (n && n.querySelectorAll) {
+                  n.querySelectorAll("video,source,script").forEach(el=>{
+                    const s = el.src || el.getAttribute('data-src') || el.getAttribute('data-href');
+                    if (s) window.__capturedRequests.push(s);
+                  });
+                }
+              } catch(e){}
             });
           }
         } catch(e){}
-      }).observe(document.documentElement || document, { childList: true, subtree: true });
+      }).observe(document.documentElement||document, { childList: true, subtree: true });
     } catch(e){}
 
-    // performance resources scan periodically
+    // perf entry scanner
     try {
-      setInterval(() => {
+      setInterval(()=> {
         try {
-          const arr = performance.getEntriesByType("resource") || [];
-          arr.forEach(en => {
-            if (en && en.name && en.name.includes(".m3u8")) window.__capturedRequests.push(en.name);
-          });
+          const entries = performance.getEntriesByType("resource") || [];
+          entries.forEach(e => { if (e && e.name && e.name.includes(".m3u8")) window.__capturedRequests.push(e.name); });
         } catch(e){}
       }, 3000);
     } catch(e){}
@@ -130,165 +118,204 @@ function now(){ return new Date().toISOString(); }
   try {
     cdp = await context.newCDPSession(page);
     await cdp.send('Network.enable');
-    cdp.on('Network.requestWillBeSent', ev => {
+    cdp.on('Network.requestWillBeSent', e => {
       try {
-        const u = ev.request && ev.request.url;
-        if (u && (u.includes(".m3u8") || u.includes(".ts") || u.includes("token=") || u.includes("signature="))) {
+        const u = e.request && e.request.url;
+        if (!u) return;
+        if (u.match(/\.m3u8(\?|$)/i) || u.match(/\.ts(\?|$)/i) || /token=|signature=|sig=/.test(u)) {
           console.log(`[CDP REQ] ${u}`);
         }
       } catch(e){}
     });
-    cdp.on('Network.webSocketFrameReceived', ev => {
+    cdp.on('Network.responseReceived', async e => {
       try {
-        const payload = ev.response && ev.response.payloadData;
-        if (payload && (payload.includes(".m3u8") || payload.includes("token="))) {
-          console.log("[CDP WS FRAME] contains m3u8/token snippet:", payload.slice(0,300));
+        const url = e.response && e.response.url;
+        const mime = (e.response && e.response.mimeType) || "";
+        if (!url) return;
+        if (url.match(/\.m3u8(\?|$)/i) || mime.includes('mpegurl') || mime.includes('vnd.apple.mpegurl')) {
+          console.log(`[CDP RES] ${url} mime:${mime} status:${e.response.status}`);
         }
-      } catch(e){}
-    });
-    cdp.on('Network.responseReceived', async ev => {
-      try{
-        const url = ev.response && ev.response.url;
-        const mime = (ev.response && ev.response.mimeType) || "";
-        if (url && (url.includes(".m3u8") || mime.includes("mpegurl"))) {
-          console.log(`[CDP RES] ${url} mime:${mime} status:${ev.response.status}`);
-        }
-        // try getResponseBody for suspicious responses (best-effort)
-        if (url && (url.includes(".m3u8") || url.includes("token=") || mime.includes("mpegurl") )) {
+        // Try to read body for manifest if suspicious
+        if (url.match(/\.m3u8(\?|$)/i) || mime.includes('mpegurl') || url.includes('token=')) {
           try {
-            const body = await cdp.send('Network.getResponseBody', { requestId: ev.requestId });
-            if (body && body.body && body.body.includes("#EXTM3U")) {
-              console.log("[CDP RES BODY] contains #EXTM3U (snippet):", body.body.slice(0,800));
+            const body = await cdp.send('Network.getResponseBody', { requestId: e.requestId });
+            if (body && body.body && body.body.includes('#EXTM3U')) {
+              console.log("[CDP RES BODY] contains #EXTM3U for", url);
             }
-          } catch(e){}
+            // also extract any URLs inside body
+            if (body && body.body) {
+              const m = body.body.match(/https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*/ig);
+              if (m) m.forEach(x => console.log("[CDP RES BODY found m3u8] ", x));
+            }
+          } catch(err){}
         }
       } catch(e){}
     });
+    // capture WS frames if token sent by WS
+    try {
+      await cdp.send('Network.enable'); // already enabled but safe
+      cdp.on('Network.webSocketFrameReceived', ev => {
+        try {
+          const payload = ev.response && ev.response.payloadData;
+          if (payload && (payload.includes('.m3u8') || payload.includes('token='))) {
+            console.log("[CDP WS FRAME] snippet:", (payload||"").slice(0,400));
+          }
+        } catch(e){}
+      });
+    } catch(e){}
   } catch(e){
-    console.log("[warn] CDP not available:", e.message);
+    console.log("[warn] CDP session not available:", e.message || e);
   }
 
-  // page listeners
-  const capturedSet = new Set();
+  // page listeners: request/response + capture bodies opportunistically
+  const candidates = new Set();
   page.on('request', req => {
     try {
       const u = req.url();
-      if (u && (u.includes(".m3u8") || u.includes(".ts") || u.includes("token=") || u.includes("signature="))) {
-        capturedSet.add(u);
+      if (!u) return;
+      if (u.match(/\.m3u8(\?|$)/i) || u.match(/\.ts(\?|$)/i) || /token=|signature=|sig=/.test(u)) {
         console.log("[REQ] " + u);
+        candidates.add(u);
       }
     } catch(e){}
   });
+
   page.on('response', async resp => {
     try {
       const u = resp.url();
-      const ct = (resp.headers()['content-type']||"").toLowerCase();
-      if (u && (u.includes(".m3u8") || ct.includes("mpegurl") || ct.includes("application/vnd.apple.mpegurl"))) {
-        capturedSet.add(u);
+      if (!u) return;
+      const ct = (resp.headers()['content-type'] || "").toLowerCase();
+      if (u.match(/\.m3u8(\?|$)/i) || ct.includes('mpegurl') || ct.includes('vnd.apple.mpegurl')) {
         console.log("[RES] " + u + " ct:" + ct + " status:" + resp.status());
-        // try opt body read for manifest detection
-        if (ct.includes("text") || ct.includes("json") || u.includes(".m3u8")) {
+        candidates.add(u);
+        // try read text for embedded links or manifest
+        try {
+          const txt = await resp.text();
+          if (txt && txt.includes('#EXTM3U')) {
+            console.log("[RES BODY] manifest body detected for", u);
+            candidates.add(u);
+          }
+          const found = txt && txt.match(/https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*/ig);
+          if (found) found.forEach(x => candidates.add(x));
+        } catch(e){}
+      } else {
+        // also scan non-m3u8 text/json responses for embedded m3u8 links
+        if (ct.includes('text') || ct.includes('json')) {
           try {
-            const t = await resp.text();
-            if (t && t.includes("#EXTM3U")) {
-              console.log("[RES BODY] manifest snippet found for", u);
+            const txt = await resp.text();
+            if (txt) {
+              const found = txt.match(/https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*/ig);
+              if (found) {
+                found.forEach(x => {
+                  console.log("[RES BODY found m3u8]", x);
+                  candidates.add(x);
+                });
+              }
             }
-            // if body contains urls, collect them
-            const found = t && t.match(/https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*/ig);
-            if (found) found.forEach(x=>capturedSet.add(x));
           } catch(e){}
         }
       }
     } catch(e){}
   });
 
-  // attempt loop (MAX_ATTEMPTS ~3, each attempt ~ NAV_TIMEOUT + WAIT_AFTER_LOAD)
-  for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    console.log(`\n[${now()}] attempt ${attempt}/${MAX_ATTEMPTS} — navigating...`);
+  // attempt loop with reloads — but short per attempt
+  for (let attempt=1; attempt<=MAX_ATTEMPTS; attempt++) {
+    console.log(`\n[${now()}] attempt ${attempt}/${MAX_ATTEMPTS} — navigating`);
     try {
-      await page.goto(TARGET, { waitUntil: 'networkidle', timeout: NAV_TIMEOUT });
-    } catch(e) {
-      console.log("[warn] goto networkidle failed:", e.message);
-      try { await page.goto(TARGET, { waitUntil: 'load', timeout: NAV_TIMEOUT }); } catch(_) {}
+      await page.goto(TARGET, { waitUntil: 'domcontentloaded', timeout: NAV_TIMEOUT });
+    } catch(e){
+      console.log("[warn] goto(domcontentloaded) failed:", e.message || e);
+      try { await page.goto(TARGET, { waitUntil: 'load', timeout: NAV_TIMEOUT }); } catch(e2){ console.log("[warn] load also failed:", e2.message||e2); }
     }
 
-    console.log(`[${now()}] waiting ${WAIT_AFTER_LOAD}ms for resources...`);
+    // Wait a little and also actively wait for any m3u8 response (no token requirement)
+    console.log(`[${now()}] waiting ${WAIT_AFTER_LOAD}ms then up to ${RESPONSE_WAIT}ms for any .m3u8 response`);
     await page.waitForTimeout(WAIT_AFTER_LOAD);
 
-    // pull window-captured
     try {
-      const win = await page.evaluate(() => {
-        try { return { reqs: window.__capturedRequests || [], blobs: window.__createdBlobs || [] }; } catch(e) { return { reqs: [], blobs: [] }; }
-      });
-      (win.reqs || []).forEach(u => capturedSet.add(u));
-      if (win.blobs && win.blobs.length) console.log("[win blobs sample]", win.blobs.slice(0,5));
-      if (win.reqs && win.reqs.length) console.log("[win capturedRequests sample]", win.reqs.slice(0,6));
+      const resp = await page.waitForResponse(r => {
+        const u = r.url();
+        if (!u) return false;
+        // accept any .m3u8 or text response that looks like manifest
+        if (u.match(/\.m3u8(\?|$)/i)) return true;
+        const ct = (r.headers()['content-type'] || "").toLowerCase();
+        if (ct.includes('mpegurl') || ct.includes('vnd.apple.mpegurl')) return true;
+        return false;
+      }, { timeout: RESPONSE_WAIT });
+      if (resp) {
+        const foundUrl = resp.url();
+        console.log("[waitForResponse] matched .m3u8:", foundUrl);
+        candidates.add(foundUrl);
+      }
+    } catch(e){
+      console.log("[waitForResponse] none matched in this attempt");
+    }
+
+    // collect any in-page captured arrays (fetch/XHR/perf)
+    try {
+      const win = await page.evaluate(() => ({ reqs: window.__capturedRequests || [], blobs: window.__createdBlobs || [] }));
+      if (Array.isArray(win.reqs) && win.reqs.length) {
+        win.reqs.forEach(u => { if(u) candidates.add(u); });
+        console.log("[win capturedRequests sample]", win.reqs.slice(0,8));
+      }
+      if (Array.isArray(win.blobs) && win.blobs.length) {
+        console.log("[win blobs sample]", win.blobs.slice(0,6));
+      }
     } catch(e){}
 
-    // performance resources check
+    // DOM scan: video/source srcs & text nodes
     try {
-      const perf = await page.evaluate(() => (performance.getEntriesByType('resource')||[]).map(e=>e.name).filter(n=>n && n.includes('.m3u8')));
-      perf.forEach(u => capturedSet.add(u));
-      if (perf.length) console.log("[performance entries]", perf);
-    } catch(e){}
-
-    // DOM scan for video/src
-    try {
-      const dom = await page.evaluate(() => {
+      const domCandidates = await page.evaluate(() => {
         const out = [];
         document.querySelectorAll('video,source').forEach(v=>{
-          try {
-            if (v.currentSrc) out.push(v.currentSrc);
-            if (v.src) out.push(v.src);
-            const ds = v.getAttribute && (v.getAttribute('data-src')||v.getAttribute('data-href'));
-            if (ds) out.push(ds);
-          } catch(e){}
+          try { if (v.currentSrc) out.push(v.currentSrc); if (v.src) out.push(v.src); } catch(e){}
         });
-        // text nodes quick search
-        const txts = [];
         const walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT, null, false);
-        while(walker.nextNode()){
+        while (walker.nextNode()) {
           const s = walker.currentNode.nodeValue;
-          if (s && s.includes('.m3u8')) txts.push(s);
+          if (s && s.includes('.m3u8')) {
+            const found = s.match(/https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*/ig);
+            if (found) found.forEach(f => out.push(f));
+          }
         }
-        // return both
-        return { resources: out, textMatches: txts.slice(0,10) };
+        return Array.from(new Set(out));
       });
-      (dom.resources||[]).forEach(u => capturedSet.add(u));
-      if (dom.textMatches && dom.textMatches.length) console.log("[dom text matches sample]", dom.textMatches.slice(0,5));
-    } catch(e){}
+      if (domCandidates && domCandidates.length) {
+        domCandidates.forEach(u => candidates.add(u));
+        console.log("[dom-scan] found:", domCandidates);
+      }
+    } catch(e){ console.log("[dom-scan] failed:", e.message || e); }
 
-    // gather & pick best candidate
-    const all = Array.from(capturedSet).filter(Boolean);
+    // if we have any candidate, pick best
+    const all = Array.from(candidates).filter(Boolean);
     if (all.length) {
-      console.log(`[${now()}] candidates found:`, all.slice(0,12));
-      // prefer .m3u8 with token
+      console.log(`[${now()}] candidates total: ${all.length}`, all.slice(0,12));
+      // prefer tokened .m3u8, else any .m3u8, else fallback conversions
       const tokened = all.find(u => /\.m3u8/i.test(u) && /token=|signature=|sig=|expires=|exp=/.test(u));
       const plain = all.find(u => /\.m3u8/i.test(u));
       const tsToken = all.find(u => /\.ts(\?|$)/i.test(u) && /token=|signature=|sig=/.test(u));
-      let pick = tokened || plain || (tsToken ? tsToken.replace(/\/[^\/]*\.ts(\?.*)?$/, '/index.m3u8') : null);
+      let pick = tokened || plain || (tsToken ? tsToken.replace(/\/[^\/]*\.ts(\?.*)?$/, "/index.m3u8") : null);
+
       if (pick) {
         console.log("[pick] selected:", pick);
-        // validate quickly with HEAD (copy cookies + referer)
+        // quick HEAD validation (copy cookies + referer)
         let ok = false;
         try {
-          // collect cookies and referer from page
           const cookies = await context.cookies();
-          const cookieHeader = cookies.map(c => `${c.name}=${c.value}`).join('; ');
-          const referer = TARGET;
-          const head = { 'User-Agent': context._options.userAgent || 'Mozilla/5.0', 'Referer': referer };
-          if (cookieHeader) head['Cookie'] = cookieHeader;
-          const res = await fetch(pick, { method: 'HEAD', headers: head, timeout: 15000 });
-          console.log("[HEAD] status", res.status, "ct:", res.headers && res.headers.get('content-type'));
-          if (res.ok || res.status === 200) ok = true;
-        } catch(e){
-          console.log("[HEAD] validation error:", e.message);
-        }
-        // if HEAD failed but URL contains .m3u8, accept as fallback
+          const cookieHeader = cookies.map(c=>`${c.name}=${c.value}`).join('; ');
+          const headers = { 'User-Agent': context._options.userAgent || 'Mozilla/5.0', 'Referer': TARGET };
+          if (cookieHeader) headers['Cookie'] = cookieHeader;
+          const hres = await fetch(pick, { method: 'HEAD', headers, timeout: 15000 });
+          console.log("[HEAD] status", hres.status, "ct:", hres.headers && hres.headers.get('content-type'));
+          if (hres.ok || hres.status === 200) ok = true;
+        } catch(e){ console.log("[HEAD] error:", e.message || e); }
+
+        // Accept plain m3u8 as fallback even if HEAD fails
         if (!ok && /\.m3u8/i.test(pick) && !pick.includes("token=")) {
-          console.log("[fallback] accepting plain m3u8 candidate despite HEAD failure");
+          console.log("[fallback] accepting plain m3u8 despite HEAD failure");
           ok = true;
         }
+
         if (ok) {
           // send to worker
           try {
@@ -300,16 +327,17 @@ function now(){ return new Date().toISOString(); }
             });
             console.log("[worker] status", wres.status, "body:", await wres.text().catch(()=>"<no body>"));
             if (wres.ok) { await browser.close(); process.exit(0); }
-          } catch(e){ console.log("[worker] send error:", e.message); }
-        }
-      }
+            else console.log("[worker] returned not ok, will continue attempts");
+          } catch(e){ console.log("[worker] send error:", e.message || e); }
+        } // if ok
+      } // if pick
     } else {
       console.log(`[${now()}] no candidates this attempt`);
     }
 
-    // reload + small backoff before next attempt
+    // reload and small backoff
     try {
-      console.log(`[${now()}] reloading page and backoff before next attempt`);
+      console.log(`[${now()}] reloading & backing off before next attempt`);
       await page.reload({ waitUntil: 'networkidle', timeout: NAV_TIMEOUT }).catch(()=>{});
       await page.waitForTimeout(3000 * attempt);
     } catch(e){}
