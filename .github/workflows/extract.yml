@@ -1,25 +1,29 @@
-name: Extract M3U8
+name: m3u8 Extractor
 
 on:
   schedule:
-    - cron: "0 * * * *" # her saat başı
-  workflow_dispatch: # manuel tetikleme de mümkün
+    - cron: '0 * * * *' # Her saat başı
+  workflow_dispatch: # Manuel tetikleme için
 
 jobs:
   extract:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v3
+      - name: Checkout repo
+        uses: actions/checkout@v4
+
       - name: Setup Node.js
         uses: actions/setup-node@v3
         with:
           node-version: 20
+
       - name: Install dependencies
-        run: npm ci
+        run: npm install
+
       - name: Run extractor
         env:
           TARGET_URL: ${{ secrets.TARGET_URL }}
           WORKER_UPDATE_URL: ${{ secrets.WORKER_UPDATE_URL }}
           WORKER_SECRET: ${{ secrets.WORKER_SECRET }}
-          MAX_ATTEMPTS: "1"
+          ATTEMPTS: 1
         run: node extract-and-send.js
