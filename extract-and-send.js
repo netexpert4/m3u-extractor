@@ -10,15 +10,16 @@ if (!TARGET_URL || !WORKER_UPDATE_URL || !WORKER_SECRET) {
   process.exit(1);
 }
 
-function looksLikeM3U(url, mimeType = "") {
-  if (url.includes(".m3u8")) return true;
-  if (mimeType.includes("application/vnd.apple.mpegurl")) return true;
-  if (mimeType.includes("application/x-mpegURL")) return true;
-  return false;
+function looksLikeM3U(url, mime = "") {
+  return (
+    url.includes(".m3u8") ||
+    mime.includes("application/vnd.apple.mpegurl") ||
+    mime.includes("application/x-mpegURL")
+  );
 }
 
 (async () => {
-  console.log("=== extractor: strict m3u8 capture ===");
+  console.log("=== extractor: auto-reload until m3u8 found ===");
   console.log("TARGET:", TARGET_URL);
 
   const browser = await playwright.chromium.launch({ headless: true });
@@ -30,49 +31,49 @@ function looksLikeM3U(url, mimeType = "") {
 
   let foundM3U = null;
 
-  page.on("response", async (response) => {
+  // capture responses
+  page.on("response", async (res) => {
     try {
-      const url = response.url();
-      const mime = response.headers()["content-type"] || "";
-      if (looksLikeM3U(url, mime)) {
-        console.log("FOUND m3u8 response:", url, mime);
+      const url = res.url();
+      const mime = res.headers()["content-type"] || "";
+      if (looksLikeM3U(url, mime) && !foundM3U) {
+        console.log("FOUND .m3u8 response:", url);
         foundM3U = url;
       }
-    } catch (e) {}
+    } catch {}
   });
 
+  // capture requests
   page.on("request", (req) => {
     const url = req.url();
-    if (looksLikeM3U(url)) {
-      console.log("FOUND m3u8 request:", url);
+    if (looksLikeM3U(url) && !foundM3U) {
+      console.log("FOUND .m3u8 request:", url);
       foundM3U = url;
     }
   });
 
-  await page.goto(TARGET_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
+  const maxAttempts = 5;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    console.log(`--- Attempt ${attempt}/${maxAttempts} ---`);
 
-  // Play tuşuna basmayı dene
-  try {
-    const btn = await page.$("button, .play, .vjs-big-play-button, .plyr__control");
-    if (btn) {
-      console.log("Clicking play button");
-      await btn.click();
+    if (attempt === 1) {
+      await page.goto(TARGET_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
     } else {
-      console.log("No explicit play button, sending Space key");
-      await page.keyboard.press(" ");
+      await page.reload({ waitUntil: "domcontentloaded", timeout: 60000 });
     }
-  } catch (e) {
-    console.log("Play click error:", e);
-  }
 
-  // 30 saniye boyunca m3u8 bekle
-  for (let i = 0; i < 30; i++) {
+    // wait up to 15s
+    for (let i = 0; i < 15; i++) {
+      if (foundM3U) break;
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+
     if (foundM3U) break;
-    await new Promise((res) => setTimeout(res, 1000));
+    console.log("No m3u8 yet, retrying...");
   }
 
   if (!foundM3U) {
-    console.error("❌ Hiç .m3u8 bulunamadı");
+    console.error("❌ Hiç .m3u8 yakalanamadı (reload sonrası da yok)");
     await browser.close();
     process.exit(1);
   }
@@ -89,6 +90,5 @@ function looksLikeM3U(url, mimeType = "") {
   });
 
   console.log("Worker response:", await res.text());
-
   await browser.close();
 })();
