@@ -6,7 +6,7 @@ const WORKER_UPDATE_URL = process.env.WORKER_UPDATE_URL;
 const WORKER_SECRET = process.env.WORKER_SECRET;
 
 (async () => {
-  console.log("Extractor v3 (hybrid scan + network)");
+  console.log("Extractor v4 (with token catch)");
 
   const browser = await playwright.chromium.launch({ headless: true });
   const context = await browser.newContext({
@@ -17,7 +17,7 @@ const WORKER_SECRET = process.env.WORKER_SECRET;
 
   let candidateUrls = new Set();
 
-  // Ağ isteklerinde ara
+  // 🔹 Request listener → en garanti yöntem
   page.on("request", (req) => {
     const url = req.url();
     if (url.includes(".m3u8")) {
@@ -26,16 +26,15 @@ const WORKER_SECRET = process.env.WORKER_SECRET;
     }
   });
 
-  // Response body içinde ara
+  // 🔹 Response body scanner → daha geniş regex
   page.on("response", async (resp) => {
     try {
       const text = await resp.text();
-      const matches = text.match(/https?:\/\/[^\s'"]+\.m3u8[^\s'"]*/g);
-      if (matches) {
-        matches.forEach((m) => {
-          console.log("[resp-body] found:", m);
-          candidateUrls.add(m);
-        });
+      const regex = /(https?:\/\/[^\s"'<>]+\.m3u8[^\s"'<>]*)/g;
+      let match;
+      while ((match = regex.exec(text)) !== null) {
+        console.log("[resp-body] found:", match[1].slice(0, 150));
+        candidateUrls.add(match[1]);
       }
     } catch (_) {}
   });
@@ -44,7 +43,8 @@ const WORKER_SECRET = process.env.WORKER_SECRET;
     await page.goto(TARGET_URL, { waitUntil: "domcontentloaded", timeout: 60000 });
     console.log("Page loaded, waiting for activity...");
 
-    await page.waitForTimeout(25000); // Player’ın yüklenmesi için bekle
+    // Player yüklenmesi için bekle
+    await page.waitForTimeout(35000);
 
     let finalPlaylist = null;
 
@@ -63,7 +63,8 @@ const WORKER_SECRET = process.env.WORKER_SECRET;
     }
 
     if (!finalPlaylist) {
-      console.log("No valid manifest found.");
+      console.log("No valid manifest found. Dumping candidates:");
+      console.log([...candidateUrls]);
       process.exit(1);
     }
 
